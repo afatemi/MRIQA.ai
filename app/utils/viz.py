@@ -14,11 +14,22 @@ import numpy as np
 from PIL import Image
 
 
-def _normalize(image: np.ndarray, wl: float | None = None, ww: float | None = None) -> np.ndarray:
+def normalize(image: np.ndarray, wl: float | None = None, ww: float | None = None) -> np.ndarray:
+    """Map an MR image to [0, 1] floats for display.
+
+    With ``wl``/``ww`` (window level / width), applies a fixed DICOM-style
+    window. Otherwise falls back to a 2-98 percentile auto-window. Returns
+    a zero-array for empty or fully-non-finite input so callers don't have
+    to guard the upstream.
+    """
     img = image.astype(np.float32)
+    if img.size == 0 or not np.isfinite(img).any():
+        # Always return a renderable 1x1 array; a zero-size zeros_like would
+        # crash imshow downstream.
+        return np.zeros((1, 1), dtype=np.float32)
     if wl is not None and ww is not None and ww > 0:
         lo, hi = wl - ww / 2.0, wl + ww / 2.0
-        return np.clip((img - lo) / (hi - lo + 1e-9), 0.0, 1.0)
+        return np.clip((img - lo) / (hi - lo), 0.0, 1.0)
     p2, p98 = np.percentile(img, (2, 98))
     if p98 - p2 < 1e-6:
         p2, p98 = float(img.min()), float(img.max() + 1)
@@ -40,7 +51,7 @@ def render_annotated(
     default 2–98 percentile auto-window (useful for faint low-contrast detail).
     """
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.imshow(_normalize(image, wl, ww), cmap="gray", interpolation="nearest")
+    ax.imshow(normalize(image, wl, ww), cmap="gray", interpolation="nearest")
     ax.set_title(title, fontsize=10)
     ax.set_xticks([])
     ax.set_yticks([])

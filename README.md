@@ -1,6 +1,6 @@
 # MRIQA.ai — ACR Large Phantom QA (MVP)
 
-A pilot-ready Streamlit web app that ingests an MRI DICOM series of the **ACR Large MRI Phantom** and runs the seven QA tests defined in the ACR MRI Quality Control Manual (2015). Five tests are fully automated; two visual scoring tests open inside the app with zoomed views.
+A pilot-ready Streamlit web app that ingests an MRI DICOM series of the **ACR Large or Medium MRI Phantom** and evaluates the ACR tests applicable to the selected series using the *ACR Large and Medium Phantom Test Guidance (Oct 2022)*. T1 selected-series analysis includes five automated tests; T2 omits the T1-only geometric-accuracy and ghosting measurements. Two visual scoring tests open inside the app with zoomed views.
 
 **Status:** MVP. **Audience:** medical physicists, QA technologists, imaging-center pilots.
 **Not a medical device. Not for diagnostic use.**
@@ -11,13 +11,13 @@ A pilot-ready Streamlit web app that ingests an MRI DICOM series of the **ACR La
 
 - Drag-and-drop DICOM upload (zip or individual `.dcm` files)
 - Auto-mapping of ACR slice roles (1, 5, 7, 11) with manual override
-- Five automated tests: **Geometric Accuracy · Slice Thickness · Slice Position · Image Intensity Uniformity (PIU) · Percent Signal Ghosting (PSG)**
+- Applicable automated tests by selected series: **Geometric Accuracy** and **PSG** on ACR T1 only; **Slice Thickness · Slice Position · PIU** on ACR T1/T2
 - Two visual scoring tests: **High-Contrast Spatial Resolution · Low-Contrast Object Detectability**
 - Polished results page with overall verdict, status badges, annotated images per test
 - In-browser-session history of completed runs
 - Professional PDF report with cover page, verdict block, per-test pages, footer with tamper-evident signature
 - CSV export of every measurement
-- ACR thresholds taken from the 2015 QC Manual; auto-adjusted for field strength
+- ACR thresholds taken from the 2022 *Large and Medium Phantom Test Guidance*; auto-adjusted for field strength and phantom model
 
 ---
 
@@ -59,20 +59,42 @@ The app is designed to deploy on Streamlit Community Cloud (free) in about 20 mi
 ```
 MRIQA.ai/
 ├── streamlit_app.py            # Streamlit entry point (lives at project root)
-├── app/                        # Python package — pure analysis code
+├── app/                        # Python package
 │   ├── io_dicom/dicom_loader.py
 │   ├── qa_tests/               # one module per ACR test
+│   │   ├── base.py             # TestSpec + shared TestResult helpers
 │   │   ├── geometric_accuracy.py
 │   │   ├── slice_thickness.py
 │   │   ├── slice_position.py
 │   │   ├── uniformity.py
 │   │   ├── ghosting.py
 │   │   ├── high_contrast_resolution.py
-│   │   └── low_contrast_detectability.py
+│   │   ├── low_contrast_detectability.py
+│   │   └── localizer_geometry.py   # sagittal S-I length
 │   ├── reporting/
 │   │   ├── pdf_report.py       # ReportLab-based, with cover page + footer
 │   │   └── csv_report.py
-│   └── utils/                  # phantom localization, ROIs, FWHM, viz helpers
+│   ├── ui/                     # Streamlit-facing modules (the only place Streamlit is imported)
+│   │   ├── landing.py
+│   │   ├── uploads.py
+│   │   ├── slice_mapping.py
+│   │   ├── analysis_inputs.py
+│   │   ├── sagittal_analysis.py
+│   │   ├── results_view.py
+│   │   ├── manual_scoring.py
+│   │   ├── viewer.py
+│   │   ├── history.py
+│   │   ├── export.py
+│   │   ├── validation.py
+│   │   ├── badges.py
+│   │   ├── banner.py
+│   │   └── auth.py
+│   └── utils/                  # phantom localization, ROI helpers, geometry, theme, viz
+│       ├── phantom.py
+│       ├── phantom_spec.py
+│       ├── geometry.py
+│       ├── theme.py
+│       └── viz.py
 ├── docs/
 │   ├── feasibility.md          # per-test feasibility analysis
 │   ├── saas_architecture.md    # technical blueprint for cloud SaaS evolution
@@ -88,23 +110,38 @@ MRIQA.ai/
 └── README.md                   # this file
 ```
 
-The analysis code in `app/` has zero dependency on Streamlit. When the project evolves into the full SaaS (architecture in `docs/saas_architecture.md`), the same Python modules lift unchanged into the production backend.
+The analysis code under `app/qa_tests/`, `app/io_dicom/`, `app/reporting/`, and `app/utils/` has zero dependency on Streamlit — Streamlit only appears inside `app/ui/` and `streamlit_app.py`. When the project evolves into the full SaaS (architecture in `docs/saas_architecture.md`), the analysis modules lift unchanged into the production backend.
 
 ---
 
 ## What ACR tests are automated, and at what thresholds
 
-All thresholds come from the **ACR MRI Quality Control Manual, 2015 edition**, and the **ACR Large Phantom Test Guidance**. They live as module-level constants near the top of each test file so they're easy to audit and adjust.
+All thresholds come from the **ACR Large and Medium Phantom Test Guidance (Oct 2022)**. They live in a single `PhantomSpec` dataclass per phantom in `app/utils/phantom_spec.py`, so they're easy to audit, override, and add new phantoms to.
 
-| # | Test                              | Automation        | Slice    | Default threshold                                             |
+Defaults below are for the **Large** phantom; **Medium** thresholds are tighter where the doc specifies (e.g. ±2 mm geometric tolerance, PIU ≥ 85 % at 3 T).
+
+The app runs one of two analyses depending on the series picked: the
+**axial selected-series analysis** (11-slice ACR series, applicable tests below) or
+the **sagittal localizer analysis** (single sagittal image, S-I length only).
+It does not combine ACR T1/T2 and site-series results into an accreditation determination.
+
+**Axial series analysis**
+
+| # | Test                              | Automation        | Slice    | Large-phantom threshold                                       |
 |---|-----------------------------------|-------------------|----------|---------------------------------------------------------------|
-| 1 | Geometric Accuracy                | Automated         | 1, 5     | 190 mm ± 2 mm (slice 5); 148 mm ± 2 mm (slice 1)              |
-| 2 | High-Contrast Spatial Resolution  | User confirmation | 1        | 1.0 mm row resolvable in UL and LR (configurable)             |
-| 3 | Slice Thickness Accuracy          | Automated         | 1        | 5.0 mm ± 0.7 mm                                               |
-| 4 | Slice Position Accuracy           | Automated         | 1, 11    | \|bar offset\| ≤ 5 mm                                         |
-| 5 | Image Intensity Uniformity (PIU)  | Automated         | 7        | ≥ 87.5 % at 3 T; ≥ 82 % at < 3 T                              |
-| 6 | Percent Signal Ghosting (PSG)     | Automated         | 7        | ≤ 3.0 %                                                       |
-| 7 | Low-Contrast Object Detectability | User confirmation | 8–11     | ≥ 9 spokes at 3 T; ≥ 7 at < 3 T                               |
+| 1 | Geometric Accuracy (axial, T1 only) | Automated      | 1, 5     | 190 mm ± 3 mm diameters                                       |
+| 2 | High-Contrast Spatial Resolution  | User confirmation | 1        | ≤1.0 mm in UL rows and LR columns                              |
+| 3 | Slice Thickness Accuracy          | Automated         | 1        | preferred 5.0 ± 0.7 mm; fails outside ±1.0 mm                 |
+| 4 | Slice Position Accuracy           | Automated         | 1, 11    | preferred \|Δ\| ≤5 mm; fails if \|Δ\| >7 mm                   |
+| 5 | Image Intensity Uniformity (PIU)  | Automated         | 7        | target ≥87.5/82%; fails below 85/80% (<3 T/≥3 T)              |
+| 6 | Percent Signal Ghosting (PSG, T1 only) | Automated   | 7        | ≤ 3.0 %                                                       |
+| 7 | Low-Contrast Object Detectability | User confirmation | 8–11     | ≥7 (<1.5 T); T1/T2 ≥30/25 (1.5–<3 T); ≥37 (≥3 T)             |
+
+**Sagittal localizer analysis**
+
+| # | Test                                          | Automation | Image       | Large-phantom threshold |
+|---|-----------------------------------------------|------------|-------------|-------------------------|
+| 1 | Geometric Accuracy — Sagittal (S-I length)    | Automated  | single scout| 148 mm ± 3 mm           |
 
 ---
 

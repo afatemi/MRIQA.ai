@@ -32,103 +32,152 @@ bright phantom edges / small end bars) and produced implausible values.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from ..io_dicom.dicom_loader import DicomSeries
+from ..utils.geometry import (
+    FwhmFit, contiguous_runs, fwhm_with_positions, smooth_boxcar,
+)
 from ..utils.phantom import localize_phantom
+from ..utils.phantom_spec import PhantomSpec
 from ..utils.viz import render_annotated
 from .base import Measurement, TestResult
 
-NOMINAL_THICKNESS_MM = 5.0
-THICKNESS_TOLERANCE_MM = 0.7
+
+# Re-export under the test-local name used by tests / earlier callers.
+RampFit = FwhmFit
 
 
-def _smooth(p: np.ndarray, n: int = 3) -> np.ndarray:
-    return np.convolve(p.astype(float), np.ones(n) / n, mode="same")
+class SliceThicknessFit(NamedTuple):
+    """Upper- and lower-ramp FWHM in mm, plus annotation positions."""
+    top_mm: float
+    bot_mm: float
+    upper: FwhmFit
+    lower: FwhmFit
 
 
-def _contiguous_runs(mask: np.ndarray):
-    runs = []
-    start = None
-    for i, v in enumerate(mask):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            runs.append((start, i - 1))
-            start = None
-    if start is not None:
-        runs.append((start, len(mask) - 1))
-    return runs
+def _find_void_band(img: np.ndarray, cx: float, cy: float, radius_px: float) -> tuple[int, int]:
+    """Locate the slice-thickness void band as a short, low-signal row run
+    near the phantom centre, bracketed above and below by bright phantom.
+    Returns ``(band_top, band_bot)`` (inclusive row indices)."""
+    c_lo, c_hi = int(cx - 0.20 * radius_px), int(cx + 0.20 * radius_px)
+    rprof = smooth_boxcar(img[:, c_lo:c_hi].mean(axis=1), 3)
+    H = img.shape[0]
+    y0, y1 = max(0, int(cy - radius_px)), min(H, int(cy + radius_px))
+    bright = float(np.percentile(rprof[y0:y1], 90))
+    void_t = bright * 0.50
+    bright_t = bright * 0.80
+    candidates: list[tuple[float, int, int]] = []
+    for s, e in contiguous_runs(rprof < void_t):
+        L = e - s + 1
+        if not (3 <= L <= 20):
+            continue
+        above = rprof[max(0, s - 4):s]
+        below = rprof[e + 1:min(len(rprof), e + 5)]
+        if (above >= bright_t).sum() < 3 or (below >= bright_t).sum() < 3:
+            continue
+        candidates.append((abs((s + e) / 2 - cy), s, e))
+    if not candidates:
+        raise ValueError("Slice-thickness void band not found near phantom centre.")
+    candidates.sort()
+    _, band_top, band_bot = candidates[0]
+    return band_top, band_bot
 
 
-def _fwhm_with_pos(profile: np.ndarray, x0: int):
-    """FWHM (px) of a bright ramp over a void baseline, plus the sub-pixel
-    left/right column positions for annotation."""
-    p = _smooth(profile, 3)
-    base = np.percentile(p, 5)        # void floor
-    peak = p.max()
-    if peak - base < 1e-6:
-        return 0.0, None, None
-    half = base + 0.5 * (peak - base)
-    above = np.where(p >= half)[0]
-    if above.size < 2:
-        return 0.0, None, None
-    l, r = above[0], above[-1]
-    lf = l - 1 + (half - p[l - 1]) / (p[l] - p[l - 1] + 1e-9) if l > 0 else float(l)
-    rf = r + (half - p[r]) / (p[r + 1] - p[r] + 1e-9) if r < len(p) - 1 else float(r)
-    return rf - lf, x0 + lf, x0 + rf
+def _find_septum(img: np.ndarray, band_top: int, band_bot: int, cx: float, radius_px: float) -> int:
+    """Row index of the dark septum between the two bright ramps inside the
+    slice-thickness insert."""
+    cc_lo, cc_hi = int(cx - 0.25 * radius_px), int(cx + 0.25 * radius_px)
+    bright = smooth_boxcar(img[band_top:band_bot + 1, cc_lo:cc_hi].mean(axis=1), 3)
+    mid = len(bright) // 2
+    up_peak = int(np.argmax(bright[: mid + 1]))
+    lo_peak = mid + int(np.argmax(bright[mid:]))
+    if lo_peak <= up_peak:
+        lo_peak = min(len(bright) - 1, up_peak + 1)
+    septum = band_top + up_peak + int(np.argmin(bright[up_peak:lo_peak + 1]))
+    return min(max(septum, band_top + 1), band_bot - 1)
 
 
-def run(series: DicomSeries) -> TestResult:
+def _draw_slice_thickness(
+    ax,
+    *,
+    cx: float,
+    radius_px: float,
+    band_top: int,
+    band_bot: int,
+    septum: int,
+    fit: SliceThicknessFit,
+    thickness_mm: float,
+    zoom: bool = True,
+) -> None:
+    up_row = (band_top + septum) // 2
+    lo_row = (septum + 1 + band_bot) // 2
+    if fit.upper.left_x is not None:
+        ax.plot([fit.upper.left_x, fit.upper.right_x], [up_row, up_row], color="cyan", lw=2)
+        ax.annotate(
+            f"top {fit.top_mm:.1f} mm", (fit.upper.right_x, up_row), color="cyan",
+            fontsize=8, va="center", xytext=(5, -6), textcoords="offset points",
+        )
+    if fit.lower.left_x is not None:
+        ax.plot([fit.lower.left_x, fit.lower.right_x], [lo_row, lo_row], color="magenta", lw=2)
+        ax.annotate(
+            f"bot {fit.bot_mm:.1f} mm", (fit.lower.right_x, lo_row), color="magenta",
+            fontsize=8, va="center", xytext=(5, 6), textcoords="offset points",
+        )
+    ax.set_title(f"Slice 1 — slice thickness {thickness_mm:.2f} mm", fontsize=10)
+    if zoom:
+        pad = int(0.6 * radius_px)
+        ax.set_xlim(cx - pad, cx + pad)
+        ax.set_ylim(band_bot + 12, band_top - 12)  # inverted y (image coords)
+
+
+def _measure_ramp_fwhms(
+    img: np.ndarray,
+    band_top: int,
+    septum: int,
+    band_bot: int,
+    cx: float,
+    radius_px: float,
+    col_spacing_mm: float,
+) -> SliceThicknessFit:
+    """Measure the FWHM of the upper and lower bright ramps inside the insert."""
+    x0, x1 = int(cx - 0.55 * radius_px), int(cx + 0.55 * radius_px)
+    up_prof = img[band_top:septum, x0:x1].mean(axis=0)
+    lo_prof = img[septum + 1:band_bot + 1, x0:x1].mean(axis=0)
+    upper = fwhm_with_positions(up_prof, x0)
+    lower = fwhm_with_positions(lo_prof, x0)
+    top_mm = upper.fwhm_px * col_spacing_mm
+    bot_mm = lower.fwhm_px * col_spacing_mm
+    if top_mm + bot_mm < 1e-6:
+        raise ValueError("Failed to fit ramp FWHM in the slice-thickness insert.")
+    return SliceThicknessFit(top_mm, bot_mm, upper, lower)
+
+
+def run(series: DicomSeries, *, spec: PhantomSpec | None = None) -> TestResult:
+    spec = spec or series.spec
+    nominal = spec.nominal_slice_thickness_mm
+    target_tol = spec.slice_thickness_target_tolerance_mm
+    fail_tol = spec.slice_thickness_failure_tolerance_mm
     res = TestResult(
         test_id="slice_thickness",
         test_name="Slice Thickness Accuracy",
         automated=True,
         passed=True,
     )
-    try:
+    with res.capture_failures():
         img = series.slice(1).astype(np.float32)
         ps = series.metadata.pixel_spacing_mm   # (row, col)
         geom = localize_phantom(img)
-        cx, cy, R = geom.cx_px, geom.cy_px, geom.radius_px
+        cx, cy, radius_px = geom.cx_px, geom.cy_px, geom.radius_px
 
-        # --- 1. Find the slice-thickness void band near the phantom centre ---
-        c_lo, c_hi = int(cx - 0.45 * R), int(cx + 0.45 * R)
-        rprof = img[:, c_lo:c_hi].mean(axis=1)
-        bg = float(np.median(rprof[rprof > 0]))
-        void_mask = rprof < bg * 0.4
-        runs = _contiguous_runs(void_mask)
-        cand = [(s, e) for (s, e) in runs if 3 <= (e - s + 1) <= 20 and s <= cy <= e]
-        if not cand:
-            cand = sorted(
-                [(s, e) for (s, e) in runs if 3 <= (e - s + 1) <= 20],
-                key=lambda rr: abs((rr[0] + rr[1]) / 2 - cy),
-            )
-        if not cand:
-            raise ValueError("Slice-thickness void band not found near phantom centre.")
-        band_top, band_bot = cand[0]
-
-        # --- 2. Find the septum between the two ramp peaks ---
-        cc_lo, cc_hi = int(cx - 0.25 * R), int(cx + 0.25 * R)
-        bright = _smooth(img[band_top:band_bot + 1, cc_lo:cc_hi].mean(axis=1), 3)
-        mid = len(bright) // 2
-        up_peak = int(np.argmax(bright[: mid + 1]))
-        lo_peak = mid + int(np.argmax(bright[mid:]))
-        if lo_peak <= up_peak:
-            lo_peak = min(len(bright) - 1, up_peak + 1)
-        septum = band_top + up_peak + int(np.argmin(bright[up_peak:lo_peak + 1]))
-        septum = min(max(septum, band_top + 1), band_bot - 1)
-
-        # --- 3. Measure each ramp's horizontal FWHM ---
-        x0, x1 = int(cx - 0.55 * R), int(cx + 0.55 * R)
-        up_prof = img[band_top:septum, x0:x1].mean(axis=0)
-        lo_prof = img[septum + 1:band_bot + 1, x0:x1].mean(axis=0)
-        fu, u_l, u_r = _fwhm_with_pos(up_prof, x0)
-        fl, l_l, l_r = _fwhm_with_pos(lo_prof, x0)
-        top_mm = fu * ps[1]
-        bot_mm = fl * ps[1]
-        if top_mm + bot_mm < 1e-6:
-            raise ValueError("Failed to fit ramp FWHM in the slice-thickness insert.")
+        band_top, band_bot = _find_void_band(img, cx, cy, radius_px)
+        septum = _find_septum(img, band_top, band_bot, cx, radius_px)
+        fit = _measure_ramp_fwhms(
+            img, band_top, septum, band_bot, cx, radius_px, ps[1],
+        )
+        top_mm, bot_mm = fit.top_mm, fit.bot_mm
 
         thickness_mm = 0.2 * (top_mm * bot_mm) / (top_mm + bot_mm)
 
@@ -136,8 +185,8 @@ def run(series: DicomSeries) -> TestResult:
             label="Measured slice thickness",
             value=round(thickness_mm, 2),
             unit="mm",
-            spec=f"{NOMINAL_THICKNESS_MM} ± {THICKNESS_TOLERANCE_MM} mm",
-            passed=abs(thickness_mm - NOMINAL_THICKNESS_MM) <= THICKNESS_TOLERANCE_MM,
+            spec=f"fail if outside {nominal} ± {fail_tol} mm (target ± {target_tol} mm)",
+            passed=abs(thickness_mm - nominal) <= fail_tol,
         )
         res.measurements.append(m)
         res.measurements.append(Measurement("Top ramp FWHM", round(top_mm, 2), "mm"))
@@ -146,48 +195,43 @@ def run(series: DicomSeries) -> TestResult:
         res.notes = (
             "Slice thickness = 0.2 × top × bot / (top + bot). FWHM of the two bright "
             "signal ramps inside the slice-thickness void band, measured at half-max "
-            "above the void baseline."
+            f"above the void baseline. Preferred target is {nominal:.1f} ± {target_tol:.1f} mm."
         )
-
-        up_row = (band_top + septum) // 2
-        lo_row = (septum + 1 + band_bot) // 2
-
-        def _draw(ax):
-            if u_l is not None:
-                ax.plot([u_l, u_r], [up_row, up_row], color="cyan", lw=2)
-                ax.annotate(f"top {top_mm:.1f} mm", (u_r, up_row), color="cyan",
-                            fontsize=8, va="center", xytext=(5, -6),
-                            textcoords="offset points")
-            if l_l is not None:
-                ax.plot([l_l, l_r], [lo_row, lo_row], color="magenta", lw=2)
-                ax.annotate(f"bot {bot_mm:.1f} mm", (l_r, lo_row), color="magenta",
-                            fontsize=8, va="center", xytext=(5, 6),
-                            textcoords="offset points")
-            ax.set_title(f"Slice 1 — slice thickness {thickness_mm:.2f} mm", fontsize=10)
-
-        # Zoom the annotated view onto the insert so the ramps are visible
-        def _draw_zoom(ax):
-            _draw(ax)
-            pad = int(0.6 * R)
-            ax.set_xlim(cx - pad, cx + pad)
-            ax.set_ylim(band_bot + 12, band_top - 12)  # inverted y (image coords)
+        if target_tol < abs(thickness_mm - nominal) <= fail_tol:
+            res.add_warning(
+                f"Slice thickness {thickness_mm:.2f} mm is outside the preferred "
+                f"{nominal:.1f} ± {target_tol:.1f} mm range but within the ACR "
+                f"failure boundary of ±{fail_tol:.1f} mm.",
+                degrade_to="medium",
+            )
 
         res.annotated_images.append((
             f"Slice 1 — slice-thickness ramps (={thickness_mm:.2f} mm)",
-            render_annotated(img, "", _draw_zoom)))
+            render_annotated(
+                img, "",
+                lambda ax: _draw_slice_thickness(
+                    ax,
+                    cx=cx, radius_px=radius_px,
+                    band_top=band_top, band_bot=band_bot, septum=septum,
+                    fit=fit, thickness_mm=thickness_mm,
+                ),
+                figsize=(8.0, 3.0),
+            ),
+        ))
 
         # --- 4. Detection-quality heuristics ---
-        if thickness_mm < 1.0 or thickness_mm > 15.0:
-            res.add_warning(
-                f"Measured thickness {thickness_mm:.2f} mm is implausible — the ramp "
-                "detector may have failed. Check the overlay.",
-                severity="low",
-            )
+        res.flag_if_implausible(
+            "Measured slice thickness",
+            round(thickness_mm, 2),
+            plausible=(1.0, 15.0),
+            unit="mm",
+            context="The ramp detector may have failed. Check the overlay.",
+        )
         if top_mm < 10 or bot_mm < 10:
             res.add_warning(
                 f"A ramp FWHM is very short (top={top_mm:.1f} mm, bot={bot_mm:.1f} mm) — "
                 "low SNR or mis-detected ramp. Check the overlay.",
-                severity="medium",
+                degrade_to="medium",
             )
         if top_mm and bot_mm:
             asym = abs(top_mm - bot_mm) / max(top_mm, bot_mm)
@@ -195,9 +239,6 @@ def run(series: DicomSeries) -> TestResult:
                 res.add_warning(
                     f"Top and bottom ramp FWHM differ by {asym*100:.0f}% — the slice may be "
                     "offset from the ramp crossing, or a ramp was mis-detected.",
-                    severity="medium",
+                    degrade_to="medium",
                 )
-    except Exception as exc:
-        res.passed = None
-        res.error = f"{type(exc).__name__}: {exc}"
     return res

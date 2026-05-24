@@ -19,7 +19,6 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 from PIL import Image
 from reportlab.lib import colors
@@ -32,28 +31,18 @@ from reportlab.platypus import (
 )
 
 from ..io_dicom.dicom_loader import DicomSeries
-from ..qa_tests.base import TestResult
+from ..qa_tests.base import TestResult, verdict_of
+from ..utils import theme
 
 
-_STATUS_COLOR = {
-    "PASS":   colors.HexColor("#1e8e3e"),
-    "FAIL":   colors.HexColor("#d93025"),
-    "REVIEW": colors.HexColor("#b06000"),
-    "ERROR":  colors.HexColor("#666666"),
-    "—":      colors.HexColor("#9aa0a6"),
-}
-_STATUS_BG = {
-    "PASS":   colors.HexColor("#ecf7ee"),
-    "FAIL":   colors.HexColor("#fdecea"),
-    "REVIEW": colors.HexColor("#fff5e1"),
-    "ERROR":  colors.HexColor("#f1f1f1"),
-    "—":      colors.HexColor("#f7f9fc"),
-}
+_STATUS_COLOR = {k: colors.HexColor(v) for k, v in theme.STATUS_COLORS.items()}
+_STATUS_BG = {k: colors.HexColor(v) for k, v in theme.STATUS_BG.items()}
+_CONF_COLOR = {k: colors.HexColor(v) for k, v in theme.CONFIDENCE_COLORS.items()}
 
-BRAND = colors.HexColor("#0B7CC4")
-INK = colors.HexColor("#1A2330")
-GREY = colors.HexColor("#5A6473")
-LIGHT_GREY = colors.HexColor("#E3E6EB")
+BRAND = colors.HexColor(theme.BRAND)
+INK = colors.HexColor(theme.INK)
+GREY = colors.HexColor(theme.GREY)
+LIGHT_GREY = colors.HexColor(theme.LIGHT_GREY)
 
 
 # --------------------------------------------------------------------------- #
@@ -69,23 +58,6 @@ def _pil_to_flowable(pil_img: Image.Image, max_w_in: float = 3.4) -> RLImage:
     aspect = h / w
     width = max_w_in * inch
     return RLImage(buf, width=width, height=width * aspect)
-
-
-def _overall_verdict(results: Iterable[TestResult]) -> tuple[str, dict]:
-    counts = {"PASS": 0, "FAIL": 0, "REVIEW": 0, "ERROR": 0}
-    for r in results:
-        counts[r.status_text()] = counts.get(r.status_text(), 0) + 1
-    if counts["FAIL"]:
-        verdict = "FAIL"
-    elif counts["ERROR"]:
-        verdict = "ERROR"
-    elif counts["REVIEW"]:
-        verdict = "REVIEW"
-    elif counts["PASS"]:
-        verdict = "PASS"
-    else:
-        verdict = "—"
-    return verdict, counts
 
 
 def _signature(payload: dict, secret: str | None = None) -> str:
@@ -147,11 +119,11 @@ class _ReportDoc(BaseDocTemplate):
 # --------------------------------------------------------------------------- #
 
 
-def _header_band() -> Table:
+def _header_band(spec_name: str) -> Table:
     """The thin brand band at the top of the cover."""
     band = Table([[Paragraph(
-        "<para align='left'><font color='white' size='14'><b>MRIQA.ai</b></font>"
-        "&nbsp;&nbsp;&nbsp;<font color='white' size='10'>ACR Large Phantom QA report</font></para>",
+        f"<para align='left'><font color='white' size='14'><b>MRIQA.ai</b></font>"
+        f"&nbsp;&nbsp;&nbsp;<font color='white' size='10'>{spec_name} QA report</font></para>",
         ParagraphStyle("brand", textColor=colors.white),
     )]], colWidths=[7.3 * inch])
     band.setStyle(TableStyle([
@@ -169,7 +141,7 @@ def _meta_block(series: DicomSeries) -> Table:
     data = [
         ["Site / Org",        "—",                                "Manufacturer", md.manufacturer or "—"],
         ["Scanner",           md.model or "—",                    "Field",        f"{md.field_strength_t:.1f} T"],
-        ["Phantom",           "ACR Large MRI Phantom",            "Sequence",     md.sequence],
+        ["Phantom",           series.spec.name,                   "Sequence",     md.sequence],
         ["Patient / Phantom", md.patient_name or "—",             "Study date",   md.study_date or "—"],
         ["Patient ID",        md.patient_id or "—",               "Series",       f"{md.series_description} (#{md.series_number})"],
         ["Pixel spacing",     f"{md.pixel_spacing_mm[0]:.3f} × {md.pixel_spacing_mm[1]:.3f} mm",
@@ -224,17 +196,20 @@ def _verdict_box(verdict: str, counts: dict) -> Table:
     return tbl
 
 
+def _fmt_value(v: float | None) -> str:
+    return "—" if v is None else str(v)
+
+
 def _summary_table(results: list[TestResult]) -> Table:
     rows = [["#", "Test", "Status", "Conf.", "Key measurement"]]
     for i, r in enumerate(results, 1):
         key = ""
         if r.measurements:
             m = r.measurements[0]
-            key = f"{m.label}: {m.value} {m.unit}".strip()
+            key = f"{m.label}: {_fmt_value(m.value)} {m.unit}".strip()
             if m.spec:
                 key += f"   (spec {m.spec})"
-        conf = getattr(r, "confidence_label", lambda: "HIGH")()
-        rows.append([str(i), r.test_name, r.status_text(), conf, key])
+        rows.append([str(i), r.test_name, r.status_text(), r.confidence_label(), key])
     tbl = Table(rows, colWidths=[0.35 * inch, 2.5 * inch, 0.8 * inch, 0.8 * inch, 2.9 * inch])
     style = [
         ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 9),
@@ -249,13 +224,11 @@ def _summary_table(results: list[TestResult]) -> Table:
         ("TOPPADDING", (0, 0), (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]
-    conf_color = {"HIGH": _STATUS_COLOR["PASS"], "MEDIUM": _STATUS_COLOR["REVIEW"], "LOW": _STATUS_COLOR["FAIL"]}
     for i, r in enumerate(results, 1):
         c = _STATUS_COLOR.get(r.status_text(), colors.black)
         style.append(("TEXTCOLOR", (2, i), (2, i), c))
         style.append(("FONT", (2, i), (2, i), "Helvetica-Bold", 9))
-        conf_label = getattr(r, "confidence_label", lambda: "HIGH")()
-        cc = conf_color.get(conf_label, INK)
+        cc = _CONF_COLOR.get(r.confidence_label(), INK)
         style.append(("TEXTCOLOR", (3, i), (3, i), cc))
         style.append(("FONT", (3, i), (3, i), "Helvetica-Bold", 9))
     tbl.setStyle(TableStyle(style))
@@ -266,7 +239,7 @@ def _measurements_table(r: TestResult) -> Table:
     rows = [["Measurement", "Value", "Unit", "Spec", "Pass"]]
     for m in r.measurements:
         passed = "" if m.passed is None else ("✓" if m.passed else "✗")
-        rows.append([m.label, f"{m.value}", m.unit, m.spec, passed])
+        rows.append([m.label, _fmt_value(m.value), m.unit, m.spec, passed])
     tbl = Table(rows, colWidths=[2.6 * inch, 1.0 * inch, 0.7 * inch, 2.0 * inch, 0.5 * inch])
     tbl.setStyle(TableStyle([
         ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 9),
@@ -293,7 +266,7 @@ def write_pdf(
     app_version: str = "0.0.0",
 ) -> Path:
     path = Path(path)
-    verdict, counts = _overall_verdict(results)
+    verdict, counts = verdict_of(results)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Tamper-evident signature
@@ -320,7 +293,7 @@ def write_pdf(
             "generated_at": generated_at,
             "signature": signature,
         },
-        title="ACR Large Phantom QA Report",
+        title=f"{series.spec.name} QA Report",
     )
 
     styles = getSampleStyleSheet()
@@ -331,7 +304,7 @@ def write_pdf(
     story = []
 
     # ----- Cover -----
-    story.append(_header_band())
+    story.append(_header_band(series.spec.name))
     story.append(Spacer(1, 10))
     story.append(_meta_block(series))
     story.append(Spacer(1, 12))
@@ -341,11 +314,11 @@ def write_pdf(
     story.append(_summary_table(results))
     story.append(Spacer(1, 14))
     story.append(Paragraph(
-        "This is a decision-support report generated by MRIQA.ai. Threshold "
-        "values are taken from the ACR MRI Quality Control Manual (2015) and "
-        "the ACR Large Phantom Test Guidance. Final QA approval and clinical "
-        "use of the scanner remain the responsibility of the supervising "
-        "medical physicist.", caption,
+        "This is a selected-series decision-support report generated by MRIQA.ai, "
+        "not a combined ACR accreditation determination. Threshold values are taken "
+        "from the ACR Large and Medium Phantom Test Guidance (Oct 2022). Final QA "
+        "approval and clinical use of the scanner remain "
+        "the responsibility of the supervising medical physicist.", caption,
     ))
     story.append(PageBreak())
 
@@ -357,13 +330,12 @@ def write_pdf(
             f"<font color='{c.hexval()}'><b>{r.test_name}</b></font>"
             f" &nbsp;<font size='10' color='{GREY.hexval()}'>— {status}</font>"
             f" &nbsp;<font size='9' color='{GREY.hexval()}'>"
-            f"(confidence: {getattr(r, 'confidence_label', lambda: 'HIGH')()})</font>",
+            f"(confidence: {r.confidence_label()})</font>",
             ParagraphStyle("h", parent=h2, fontSize=14, leading=18),
         ))
         # Warnings, if any
-        warnings = getattr(r, "warnings", None) or []
-        if warnings:
-            warning_html = "<br/>".join(f"• {w}" for w in warnings)
+        if r.warnings:
+            warning_html = "<br/>".join(f"• {w}" for w in r.warnings)
             story.append(Paragraph(
                 f"<font color='{_STATUS_COLOR['REVIEW'].hexval()}'><b>Detection warnings:</b></font><br/>{warning_html}",
                 body,

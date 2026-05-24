@@ -1,51 +1,125 @@
-"""Test 7 — Low-Contrast Object Detectability / LCD (ACR MR QC Manual 2015 §3.7)
+"""Test 7 — Low-Contrast Object Detectability / LCD
+(ACR Large and Medium Phantom Test Guidance, Oct 2022, § 7)
 
 User-confirmation test.
 
 Procedure
 ---------
 Slices 8, 9, 10, 11 each contain a low-contrast disk pattern (10 spokes,
-each spoke a series of disks of decreasing contrast). The technologist
-counts the number of *complete* spokes visible on each slice; the test
-result is the sum across all four slices.
+each spoke three disks of decreasing contrast). Per slice the disk
+contrasts are 1.4 %, 2.5 %, 3.6 %, 5.1 % respectively, so slice 11
+saturates first. The technologist counts the number of *complete*
+spokes visible on each slice; the test result is the **sum** across all
+four slices.
 
-Action limits at 3 T: ≥ 9 spokes.
-At < 3 T: ≥ 7 spokes (manual cites 9 if extremity coil, 7 for body).
-This MVP defaults to 9 at 3 T and 7 otherwise.
+Action limits (per § Table 5), applied to the total spoke count:
+    - 3 T:        ≥ 37 (both ACR-T1 and ACR-T2)
+    - 1.5–<3 T:  ACR-T1 ≥ 30, ACR-T2 ≥ 25
+    - < 1.5 T:    ≥ 7
+
+The limits are identical for Large and Medium phantoms.
 """
 
 from __future__ import annotations
 
 import numpy as np
+from skimage.filters import threshold_otsu
+from skimage.measure import label, regionprops
 
 from ..io_dicom.dicom_loader import DicomSeries
 from ..utils.phantom import localize_phantom
+from ..utils.phantom_spec import PhantomSpec, is_high_field, is_low_field
 from ..utils.viz import render_annotated
 from .base import Measurement, TestResult
 
 
-def run(series: DicomSeries, *, user_input: dict | None = None) -> TestResult:
-    """`user_input` is a dict {8: spokes, 9: spokes, 10: spokes, 11: spokes}."""
+def _draw_lcd_title(ax, acr: int) -> None:
+    ax.set_title(
+        f"Slice {acr} — low-contrast spokes (count complete spokes)",
+        fontsize=9,
+    )
+
+
+def _threshold_for(series: DicomSeries, spec: PhantomSpec) -> int:
+    field_strength = series.metadata.field_strength_t
+    if is_high_field(field_strength):
+        return spec.lcd_threshold_3t
+    if is_low_field(field_strength):
+        return spec.lcd_threshold_sub_1_5t
+    if series.metadata.sequence == "T2":
+        return spec.lcd_threshold_midfield_t2
+    return spec.lcd_threshold_midfield_t1
+
+
+def _lcd_chamber_center(img: np.ndarray, phantom_mask: np.ndarray) -> tuple[float, float] | None:
+    """Centroid of the LCD insert chamber on an axial slice.
+
+    The phantom mask centroid is not always a good crop target — on the
+    ACR Large/Medium phantoms there is enough bright asymmetric structure
+    (fiducials, grid markers) to shift the area centroid above the actual
+    LCD pattern. Inside the phantom mask the LCD insert is the largest
+    dark connected component; its centroid is the right anchor for the
+    spokes view.
+    """
+    try:
+        t = threshold_otsu(img)
+    except ValueError:
+        # threshold_otsu raises ValueError on constant images.
+        return None
+    dark_interior = (img < t) & phantom_mask
+    lbl = label(dark_interior)
+    if lbl.max() == 0:
+        return None
+    biggest = max(regionprops(lbl), key=lambda r: r.area)
+    cy, cx = biggest.centroid
+    return float(cy), float(cx)
+
+
+def run(
+    series: DicomSeries,
+    *,
+    spec: PhantomSpec | None = None,
+    user_input: dict | None = None,
+) -> TestResult:
+    """`user_input` is a dict {acr_slice_role: spokes_seen, ...}."""
+    spec = spec or series.spec
+    lcd_slices = spec.lcd_slices
     res = TestResult(
         test_id="low_contrast_detectability",
         test_name="Low-Contrast Object Detectability",
         automated=False,
         passed=None,
     )
-    try:
-        for acr in (8, 9, 10, 11):
-            if acr not in series.acr_slice_map:
+    with res.capture_failures():
+        missing_slices: list[int] = []
+        for acr in lcd_slices:
+            slice_img = series.try_slice(acr)
+            if slice_img is None:
+                missing_slices.append(acr)
                 continue
-            img = series.slice(acr).astype(np.float32)
+            img = slice_img.astype(np.float32)
             geom = localize_phantom(img)
-            # Zoom onto the central low-contrast disk pattern (the spokes occupy
-            # roughly the central 0.7R) so the faint disks are easier to count.
+            # Zoom onto the central low-contrast disk pattern. The spoke
+            # insert is the same physical size in the Large and Medium
+            # phantoms, so anchor the crop to a fixed mm half-width from the
+            # spec rather than scaling with phantom radius. Center on the LCD
+            # chamber itself (largest dark region inside the phantom) rather
+            # than the phantom centroid — asymmetric bright structure on the
+            # phantom (fiducials, grid markers) pulls the area centroid above
+            # the actual LCD pattern.
+            center = _lcd_chamber_center(img, geom.mask)
+            if center is None:
+                cy_c, cx_c = geom.cy_px, geom.cx_px
+            else:
+                cy_c, cx_c = center
             H, W = img.shape
-            f = 0.78
-            y0 = max(0, int(geom.cy_px - geom.radius_px * f))
-            y1 = min(H, int(geom.cy_px + geom.radius_px * f))
-            x0 = max(0, int(geom.cx_px - geom.radius_px * f))
-            x1 = min(W, int(geom.cx_px + geom.radius_px * f))
+            ps = series.metadata.pixel_spacing_mm  # (row, col)
+            half_px_y = max(1, int(round(spec.lcd_insert_half_width_mm / ps[0])))
+            half_px_x = max(1, int(round(spec.lcd_insert_half_width_mm / ps[1])))
+            y0 = max(0, int(cy_c) - half_px_y)
+            y1 = min(H, int(cy_c) + half_px_y)
+            x0 = max(0, int(cx_c) - half_px_x)
+            x1 = min(W, int(cx_c) + half_px_x)
             crop = img[y0:y1, x0:x1]
 
             # A tighter contrast window makes the low-contrast spokes more visible.
@@ -57,18 +131,24 @@ def run(series: DicomSeries, *, user_input: dict | None = None) -> TestResult:
                 ww = max(1.0, (hi - lo) * 1.1)
             else:
                 wl = ww = None
-
-            def _draw(ax, acr=acr):
-                ax.set_title(f"Slice {acr} — low-contrast spokes (count complete spokes)",
-                             fontsize=9)
+                res.add_warning(
+                    f"Slice {acr}: LCD chamber crop has no positive signal — "
+                    "the chamber may have been mis-localized. Check the overlay.",
+                    degrade_to="medium",
+                )
 
             res.annotated_images.append((
                 f"Slice {acr} — LCD pattern",
-                render_annotated(crop, "", _draw, wl=wl, ww=ww)))
+                render_annotated(
+                    crop, "",
+                    lambda ax, acr=acr: _draw_lcd_title(ax, acr),
+                    wl=wl, ww=ww,
+                ),
+            ))
 
         if user_input:
             total = 0
-            for acr in (8, 9, 10, 11):
+            for acr in lcd_slices:
                 v = int(user_input.get(acr, 0) or 0)
                 total += v
                 res.measurements.append(Measurement(
@@ -76,19 +156,31 @@ def run(series: DicomSeries, *, user_input: dict | None = None) -> TestResult:
                     value=float(v),
                     unit="spokes",
                 ))
-            is_3t = series.metadata.field_strength_t >= 3.0 - 0.05
-            threshold = 9 if is_3t else 7
+            threshold = _threshold_for(series, spec)
+            slice_range = f"{lcd_slices[0]}–{lcd_slices[-1]}"
             res.measurements.append(Measurement(
-                label="Total spokes (slices 8–11)",
+                label=f"Total spokes (slices {slice_range})",
                 value=float(total),
                 unit="spokes",
                 spec=f"≥ {threshold}",
                 passed=total >= threshold,
             ))
-            res.passed = total >= threshold
+            if missing_slices:
+                res.error = (
+                    "Required LCD slice(s) not mapped: "
+                    + ", ".join(str(s) for s in missing_slices)
+                    + "."
+                )
+                res.passed = None
+            else:
+                res.passed = total >= threshold
         else:
             res.notes = "Count complete spokes on each slice and enter values in the UI."
-    except Exception as exc:
-        res.passed = None
-        res.error = f"{type(exc).__name__}: {exc}"
+            if missing_slices:
+                res.add_warning(
+                    "Required LCD slice(s) not mapped: "
+                    + ", ".join(str(s) for s in missing_slices)
+                    + ".",
+                    degrade_to="medium",
+                )
     return res

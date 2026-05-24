@@ -1,22 +1,24 @@
-"""Test 5 — Image Intensity Uniformity / PIU (ACR MR QC Manual 2015 §3.5)
+"""Test 5 — Image Intensity Uniformity / PIU
+(ACR Large and Medium Phantom Test Guidance, Oct 2022, § 5)
 
 Procedure
 ---------
 * Use slice 7 of the ACR axial series.
-* Define a large ROI of ~200 cm² (~80% of the phantom area) centered in
-  the phantom.
+* Define a large ROI centered in the phantom (200 cm² for Large,
+  160 cm² for Medium — see ``spec.piu_large_roi_area_cm2``).
 * Slide a small ROI (~1 cm²) inside the large ROI. Find the small ROI
   with the highest mean signal and the small ROI with the lowest mean
   signal.
 * PIU = 100 × (1 − (high − low) / (high + low)).
-* Action limits:
-    - ≥ 87.5 % when field strength ≥ 3 T
-    - ≥ 82.0 % otherwise (1.5 T)
+* Limits (Large phantom, per § 5.4 / Table 4):
+    - target ≥ 87.5 %, fail below 85.0 % at < 3 T
+    - target ≥ 82.0 %, fail below 80.0 % at 3 T
+  Medium phantom is tighter (≥ 90 % at < 3 T, ≥ 85 % at 3 T).
 
 Implementation
 --------------
 We rasterize a candidate-centers grid inside the large ROI and compute
-the small-ROI mean using `scipy.ndimage.uniform_filter`, which gives the
+the small-ROI mean using a circular convolution kernel, which gives the
 mean of every possible small ROI in one pass. Then we mask to candidate
 centers and take min/max.
 """
@@ -26,79 +28,143 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy.ndimage import uniform_filter
+from matplotlib.patches import Circle
+from scipy.ndimage import convolve
 
 from ..io_dicom.dicom_loader import DicomSeries
-from ..utils.geometry import circular_roi_mask
+from ..utils.geometry import circular_roi_mask, radius_px_for_area_cm2
 from ..utils.phantom import localize_phantom, phantom_quality_warnings
+from ..utils.phantom_spec import PhantomSpec, is_high_field
 from ..utils.viz import render_annotated
 from .base import Measurement, TestResult
 
-LARGE_ROI_AREA_CM2 = 200.0      # ~200 cm²
-SMALL_ROI_AREA_CM2 = 1.0        # ~1 cm²
-PIU_THRESHOLD_LT_3T = 82.0
-PIU_THRESHOLD_GE_3T = 87.5
+
+def _draw_uniformity(
+    ax,
+    *,
+    cx: float,
+    cy: float,
+    r_large: float,
+    r_small: float,
+    high_xy: tuple[int, int],
+    low_xy: tuple[int, int],
+    s_high: float,
+    s_low: float,
+    piu: float,
+) -> None:
+    ax.add_patch(Circle((cx, cy), r_large, fill=False, edgecolor="cyan", lw=1.5))
+    cx_high, cy_high = high_xy
+    cx_low, cy_low = low_xy
+    ax.add_patch(Circle((cx_high, cy_high), r_small, fill=False, edgecolor="red", lw=1.6))
+    ax.annotate(
+        f"max={s_high:.0f}", (cx_high, cy_high), color="red", fontsize=8,
+        xytext=(8, -8), textcoords="offset points",
+    )
+    ax.add_patch(Circle((cx_low, cy_low), r_small, fill=False, edgecolor="blue", lw=1.6))
+    ax.annotate(
+        f"min={s_low:.0f}", (cx_low, cy_low), color="blue", fontsize=8,
+        xytext=(8, 8), textcoords="offset points",
+    )
+    ax.set_title(f"Slice 7 — PIU = {piu:.2f} %", fontsize=10)
 
 
-def _radius_for_area_px(area_cm2: float, pixel_spacing_mm) -> float:
-    area_mm2 = area_cm2 * 100.0  # cm² -> mm²
-    px_area_mm2 = pixel_spacing_mm[0] * pixel_spacing_mm[1]
-    radius_px = math.sqrt(area_mm2 / px_area_mm2 / math.pi)
-    return radius_px
+def _candidate_centers(
+    img: np.ndarray,
+    candidate_mask: np.ndarray,
+    kernel: np.ndarray,
+    r_small: float,
+    large_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return ``(ys, xs, n_excluded)`` for small-ROI candidate centres inside
+    the candidate mask that don't overlap air voxels.
+
+    A small ROI is only a valid candidate if it lies entirely on phantom
+    signal; this excludes positions whose averaging box catches the
+    phantom's top air bubble or other voids. Falls back to *including*
+    air-overlapping candidates when fewer than 10 air-free positions
+    remain (better a degraded measurement than no measurement at all).
+    """
+    med = float(np.median(img[large_mask]))
+    air = (img < 0.5 * med).astype(np.float32)
+    air_frac = convolve(air, kernel, mode="constant", cval=1.0) / kernel.sum()
+
+    margin = int(math.ceil(r_small))
+    ys, xs = np.where(candidate_mask)
+    valid = (
+        (ys >= margin) & (ys < img.shape[0] - margin)
+        & (xs >= margin) & (xs < img.shape[1] - margin)
+    )
+    ys, xs = ys[valid], xs[valid]
+    af = air_frac[ys, xs]
+    clean = af <= 1e-6
+    n_excluded = int((~clean).sum())
+    if clean.sum() >= 10:
+        ys, xs = ys[clean], xs[clean]
+    return ys, xs, n_excluded
 
 
-def run(series: DicomSeries) -> TestResult:
+def _circular_kernel(radius_px: float) -> np.ndarray:
+    margin = int(math.ceil(radius_px))
+    diameter = 2 * margin + 1
+    return circular_roi_mask((diameter, diameter), margin, margin, radius_px).astype(np.float32)
+
+
+def run(series: DicomSeries, *, spec: PhantomSpec | None = None) -> TestResult:
+    spec = spec or series.spec
+    large_area = spec.piu_large_roi_area_cm2
+    small_area = spec.piu_small_roi_area_cm2
+    target_3t = spec.piu_target_3t_percent
+    target_lo = spec.piu_target_lowfield_percent
+    failure_3t = spec.piu_failure_3t_percent
+    failure_lo = spec.piu_failure_lowfield_percent
     res = TestResult(
         test_id="uniformity",
         test_name="Image Intensity Uniformity (PIU)",
         automated=True,
         passed=True,
     )
-    try:
+    with res.capture_failures():
         img = series.slice(7).astype(np.float32)
         ps = series.metadata.pixel_spacing_mm
         geom = localize_phantom(img)
-        for w in phantom_quality_warnings(geom, ps):
-            res.add_warning(w, severity="medium")
+        for w in phantom_quality_warnings(geom, ps, spec):
+            res.add_warning(w, degrade_to="medium")
 
-        r_large = _radius_for_area_px(LARGE_ROI_AREA_CM2, ps)
-        # Don't let the large ROI exceed the phantom interior
-        r_large = min(r_large, geom.radius_px * 0.85)
-        r_small = _radius_for_area_px(SMALL_ROI_AREA_CM2, ps)
+        r_large = radius_px_for_area_cm2(large_area, ps)
+        r_small = radius_px_for_area_cm2(small_area, ps)
+
+        # The prescribed ROI area is fixed by ACR; we don't clamp it to the
+        # detected phantom radius. If the detector underestimates the phantom,
+        # the ROI can extend past the interior and bias PIU — warn instead.
+        if r_large > geom.radius_px * 0.95:
+            res.add_warning(
+                f"Prescribed large ROI radius ({r_large:.1f} px) is close to or "
+                f"exceeds the detected phantom radius ({geom.radius_px:.1f} px); "
+                "the ROI may include non-phantom signal. Check the overlay.",
+                degrade_to="medium",
+            )
 
         large_mask = circular_roi_mask(img.shape, geom.cy_px, geom.cx_px, r_large)
-        # Mean of the small ROI at every center pixel: a uniform circular filter.
-        # We approximate the circular small-ROI mean with a square box of equal area.
-        # This is the standard interpretation used by many ACR analysers.
-        box_size = int(round(2 * r_small))
-        if box_size < 3:
-            box_size = 3
-        small_mean = uniform_filter(img, size=box_size)
+        # The ACR procedure requires the small 1 cm² ROI to be placed *inside*
+        # the large ROI (§ 5 steps 3, 4, 6). Constrain candidate centers to a
+        # tighter disk so the small ROI disk fits fully within the large ROI
+        # boundary — half-pixel-pad so the rasterized circle stays inside.
+        candidate_mask = circular_roi_mask(
+            img.shape, geom.cy_px, geom.cx_px, max(1.0, r_large - r_small - 0.5),
+        )
+        # Mean of the prescribed circular small ROI at every possible center.
+        kernel = _circular_kernel(r_small)
+        small_mean = convolve(img, kernel, mode="constant", cval=0.0) / kernel.sum()
 
-        # --- Exclude air / voids (e.g. the phantom's top air bubble or any
-        #     structural void) so they don't dominate the "low" ROI. We measure
-        #     the uniformity of phantom *material*, not air. A small ROI is only
-        #     a valid candidate if it lies entirely on phantom signal.
-        med = float(np.median(img[large_mask]))
-        air = (img < 0.5 * med).astype(np.float32)
-        air_frac = uniform_filter(air, size=box_size)   # fraction of small ROI that is air
-
-        # Candidate centers: large ROI, away from the image edge, no air overlap
-        margin = int(math.ceil(r_small))
-        ys, xs = np.where(large_mask)
-        valid = (ys >= margin) & (ys < img.shape[0] - margin) & (xs >= margin) & (xs < img.shape[1] - margin)
-        ys, xs = ys[valid], xs[valid]
-        af = air_frac[ys, xs]
-        clean = af <= 1e-6
-        n_excluded = int((~clean).sum())
-        if clean.sum() >= 10:           # keep only air-free candidates if enough remain
-            ys, xs = ys[clean], xs[clean]
+        ys, xs, n_excluded = _candidate_centers(
+            img, candidate_mask, kernel, r_small, large_mask,
+        )
         if n_excluded > 20:
             res.add_warning(
                 f"Excluded {n_excluded} ROI position(s) overlapping air/void (e.g. the "
                 "phantom's top air bubble) from the uniformity search. Uniformity is "
                 "measured on phantom material only.",
-                severity="medium" if n_excluded > 800 else "high",
+                degrade_to="medium" if n_excluded > 800 else "high",
             )
 
         means = small_mean[ys, xs]
@@ -111,54 +177,56 @@ def run(series: DicomSeries) -> TestResult:
 
         piu = 100.0 * (1.0 - (s_high - s_low) / (s_high + s_low + 1e-9))
 
-        is_3t = series.metadata.field_strength_t >= 3.0 - 0.05
-        threshold = PIU_THRESHOLD_GE_3T if is_3t else PIU_THRESHOLD_LT_3T
+        is_3t = is_high_field(series.metadata.field_strength_t)
+        target = target_3t if is_3t else target_lo
+        failure = failure_3t if is_3t else failure_lo
 
         m = Measurement(
             label="PIU",
             value=round(piu, 2),
             unit="%",
-            spec=f"≥ {threshold:.1f} % (B0 = {series.metadata.field_strength_t:.1f} T)",
-            passed=piu >= threshold,
+            spec=f"fail if < {failure:.1f} %; target ≥ {target:.1f} % (B0 = {series.metadata.field_strength_t:.2f} T)",
+            passed=piu >= failure,
         )
         res.measurements.append(m)
         res.passed = bool(m.passed)
         res.notes = (
-            f"Large ROI area ≈ {LARGE_ROI_AREA_CM2:.0f} cm² (radius={r_large*((ps[0]+ps[1])/2):.1f} mm). "
-            f"Small ROI ≈ {SMALL_ROI_AREA_CM2:.0f} cm². High mean = {s_high:.1f}, Low mean = {s_low:.1f}."
+            f"Large ROI area ≈ {large_area:.0f} cm² (radius={r_large*((ps[0]+ps[1])/2):.1f} mm). "
+            f"Small ROI ≈ {small_area:.0f} cm². High mean = {s_high:.1f}, Low mean = {s_low:.1f}."
         )
+        if failure <= piu < target:
+            res.add_warning(
+                f"PIU = {piu:.2f}% is below the preferred ≥ {target:.1f}% target "
+                f"but above the ACR failure boundary of {failure:.1f}%.",
+                degrade_to="medium",
+            )
 
         # --- Detection-quality heuristics ---
         if piu < 50 or piu > 100:
             res.add_warning(
                 f"PIU = {piu:.1f}% is outside the plausible range (50–100%); the small-ROI "
                 "search may have included background or air voxels. Check the overlay.",
-                severity="low",
+                degrade_to="low",
             )
         if s_low <= 0:
             res.add_warning(
                 "Lowest small-ROI mean is zero or negative — the ROI may have landed outside "
                 "the phantom.",
-                severity="low",
+                degrade_to="low",
             )
 
-        # ----- Annotate -----
-        def _draw(ax):
-            from matplotlib.patches import Circle
-            # Large ROI
-            ax.add_patch(Circle((geom.cx_px, geom.cy_px), r_large, fill=False, edgecolor="cyan", lw=1.5))
-            # Small high (red) and low (blue) ROIs
-            ax.add_patch(Circle((cx_high, cy_high), r_small, fill=False, edgecolor="red", lw=1.6))
-            ax.annotate(f"max={s_high:.0f}", (cx_high, cy_high), color="red", fontsize=8,
-                        xytext=(8, -8), textcoords="offset points")
-            ax.add_patch(Circle((cx_low, cy_low), r_small, fill=False, edgecolor="blue", lw=1.6))
-            ax.annotate(f"min={s_low:.0f}", (cx_low, cy_low), color="blue", fontsize=8,
-                        xytext=(8, 8), textcoords="offset points")
-            ax.set_title(f"Slice 7 — PIU = {piu:.2f} %", fontsize=10)
-
-        res.annotated_images.append((f"Slice 7 — PIU={piu:.2f}%",
-                                     render_annotated(img, "", _draw)))
-    except Exception as exc:
-        res.passed = None
-        res.error = f"{type(exc).__name__}: {exc}"
+        res.annotated_images.append((
+            f"Slice 7 — PIU={piu:.2f}%",
+            render_annotated(
+                img, "",
+                lambda ax: _draw_uniformity(
+                    ax,
+                    cx=geom.cx_px, cy=geom.cy_px,
+                    r_large=r_large, r_small=r_small,
+                    high_xy=(cx_high, cy_high),
+                    low_xy=(cx_low, cy_low),
+                    s_high=s_high, s_low=s_low, piu=piu,
+                ),
+            ),
+        ))
     return res

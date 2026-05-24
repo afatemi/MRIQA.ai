@@ -14,7 +14,9 @@ Responsibilities
 
 from __future__ import annotations
 
-import io as _io
+import logging
+import struct
+from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -22,6 +24,21 @@ from typing import Iterable
 import numpy as np
 import pydicom
 from pydicom.dataset import FileDataset
+from pydicom.errors import BytesLengthException, InvalidDicomError
+
+from ..utils.phantom_spec import PhantomSpec, default_phantom
+
+logger = logging.getLogger(__name__)
+
+# Exceptions pydicom and friends raise on a file that isn't a usable DICOM.
+# Anything outside this set is unexpected and should propagate so it's not
+# silently swallowed. ValueError covers most malformed-tag conditions;
+# BytesLengthException is pydicom's specific signal for a tag whose length
+# doesn't divide its VR (often fires on PDFs/JPEGs read with force=True).
+NOT_A_DICOM_ERRORS: tuple[type[Exception], ...] = (
+    InvalidDicomError, BytesLengthException, OSError, struct.error,
+    EOFError, ValueError,
+)
 
 
 @dataclass
@@ -43,6 +60,11 @@ class SeriesMetadata:
     n_slices: int = 0
     repetition_time_ms: float = 0.0
     echo_time_ms: float = 0.0
+    # When a multi-echo (e.g. double-echo T2) acquisition is uploaded, the
+    # loader keeps only the longest-TE images per ACR Test Guidance § 0.3
+    # ("only the second-echo images are evaluated"). The discarded TE values
+    # are recorded here so validate_series can warn the user about the split.
+    discarded_echo_times_ms: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -54,9 +76,9 @@ class DicomSeries:
     datasets: list[FileDataset] = field(default_factory=list, repr=False)
     # Mapping from "ACR slice role" (e.g. 1, 5, 7, 11) -> physical slice index 0..n-1
     acr_slice_map: dict[int, int] = field(default_factory=dict)
-    # Optional sagittal localizer series, attached for the geometric-accuracy
-    # S-I length (148 mm) measurement which cannot be done on an axial slice.
-    localizer: "DicomSeries | None" = field(default=None, repr=False)
+    # Phantom model (Large, Medium, …) — every QA test reads spec from here so
+    # geometry/threshold constants are not hardcoded per test.
+    spec: PhantomSpec = field(default_factory=default_phantom)
 
     def slice(self, acr_role: int) -> np.ndarray:
         """Return the 2D pixel array for the given ACR slice role (1-based)."""
@@ -64,16 +86,39 @@ class DicomSeries:
             raise KeyError(f"No physical slice mapped to ACR slice {acr_role}")
         return self.pixel_array[self.acr_slice_map[acr_role]]
 
+    def try_slice(
+        self, acr_role: int, *, spec_fallback: bool = False,
+    ) -> np.ndarray | None:
+        """Return the 2D pixel array for ``acr_role``, or ``None`` if not
+        available. With ``spec_fallback=True``, fall back to the spec's
+        default role→index mapping (and cache the result in
+        ``acr_slice_map``) when the role is missing from the live map.
+        """
+        if acr_role in self.acr_slice_map:
+            return self.pixel_array[self.acr_slice_map[acr_role]]
+        if spec_fallback:
+            idx = self.spec.slice_role_indices.get(acr_role)
+            if idx is not None and idx < self.pixel_array.shape[0]:
+                self.acr_slice_map[acr_role] = idx
+                return self.pixel_array[idx]
+        return None
+
 
 def _read_one(source) -> FileDataset | None:
-    """Read a single DICOM from path, Path, bytes, or file-like."""
+    """Read a single DICOM from path, Path, bytes, or file-like.
+
+    Returns None for anything that doesn't parse as a DICOM. Truly
+    unexpected errors (programming bugs in pydicom, etc.) propagate so
+    they aren't silently lost.
+    """
     try:
         if hasattr(source, "read"):
             return pydicom.dcmread(source, force=True)
         if isinstance(source, (bytes, bytearray)):
-            return pydicom.dcmread(_io.BytesIO(source), force=True)
+            return pydicom.dcmread(BytesIO(source), force=True)
         return pydicom.dcmread(str(source), force=True)
-    except Exception:
+    except NOT_A_DICOM_ERRORS:
+        logger.debug("DICOM read failed for %r", source, exc_info=True)
         return None
 
 
@@ -81,7 +126,8 @@ def _has_image(ds: FileDataset) -> bool:
     try:
         _ = ds.pixel_array
         return True
-    except Exception:
+    except (AttributeError, ValueError, KeyError):
+        logger.debug("pixel_array unavailable for %r", ds, exc_info=True)
         return False
 
 
@@ -96,6 +142,69 @@ class DicomLoadError(ValueError):
     def __init__(self, message: str, *, tip: str = ""):
         super().__init__(message)
         self.tip = tip
+
+
+def _str_tag(ds: FileDataset, tag: str) -> str:
+    return str(getattr(ds, tag, "") or "")
+
+
+def _float_tag(ds: FileDataset, tag: str) -> float:
+    return float(getattr(ds, tag, 0.0) or 0.0)
+
+
+def _int_tag(ds: FileDataset, tag: str) -> int:
+    return int(getattr(ds, tag, 0) or 0)
+
+
+def _guess_sequence(description: str) -> str:
+    desc = description.lower()
+    if "t1" in desc:
+        return "T1"
+    if "t2" in desc or "dual" in desc:
+        return "T2"
+    if "loc" in desc:
+        return "Localizer"
+    return "Unknown"
+
+
+def _metadata_from_dataset(
+    head: FileDataset,
+    volume: np.ndarray,
+    discarded_echo_times: list[float],
+) -> SeriesMetadata:
+    """Extract a SeriesMetadata from the first dataset of the series."""
+    ps = getattr(head, "PixelSpacing", [1.0, 1.0])
+    description = _str_tag(head, "SeriesDescription")
+    meta = SeriesMetadata(
+        patient_name=_str_tag(head, "PatientName"),
+        patient_id=_str_tag(head, "PatientID"),
+        study_date=_str_tag(head, "StudyDate"),
+        manufacturer=_str_tag(head, "Manufacturer"),
+        model=_str_tag(head, "ManufacturerModelName"),
+        field_strength_t=_float_tag(head, "MagneticFieldStrength"),
+        series_description=description,
+        series_number=_int_tag(head, "SeriesNumber"),
+        sequence=_guess_sequence(description),
+        pixel_spacing_mm=(float(ps[0]), float(ps[1])),
+        slice_thickness_mm=_float_tag(head, "SliceThickness"),
+        spacing_between_slices_mm=_float_tag(head, "SpacingBetweenSlices"),
+        rows=int(volume.shape[1]),
+        cols=int(volume.shape[2]),
+        n_slices=int(volume.shape[0]),
+        repetition_time_ms=_float_tag(head, "RepetitionTime"),
+        echo_time_ms=_float_tag(head, "EchoTime"),
+        discarded_echo_times_ms=list(discarded_echo_times),
+    )
+    return meta
+
+
+def _pad_or_crop(arr: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """Make sure all slices share the same (rows, cols)."""
+    out = np.zeros(target_shape, dtype=arr.dtype)
+    rs = min(arr.shape[0], target_shape[0])
+    cs = min(arr.shape[1], target_shape[1])
+    out[:rs, :cs] = arr[:rs, :cs]
+    return out
 
 
 def load_series(sources: Iterable) -> DicomSeries:
@@ -153,16 +262,41 @@ def load_series(sources: Iterable) -> DicomSeries:
             tip="This tool is for MRI ACR phantom QA only. Upload an MR series.",
         )
 
-    # Sort: prefer InstanceNumber; fallback to SliceLocation (descending so
-    # superior slices come first, then we reverse if needed).
+    # Multi-echo split. The ACR T2 series may be acquired as a double-echo
+    # spin echo (TE 20/80) on legacy protocols, in which case the upload will
+    # contain two instances per slice. Per the 2022 ACR Large and Medium
+    # Phantom Test Guidance § 0.3, "When analyzing data from a double-echo
+    # acquisition, only the second-echo images (TE=80) are evaluated." We
+    # generalize: when multiple distinct EchoTime values are present, keep
+    # only the longest-TE group and record the discarded TEs for the UI.
+    echo_groups: dict[float, list[FileDataset]] = {}
+    for ds in datasets:
+        te = round(float(getattr(ds, "EchoTime", 0.0) or 0.0), 1)
+        echo_groups.setdefault(te, []).append(ds)
+
+    discarded_echo_times: list[float] = []
+    if len(echo_groups) > 1:
+        kept_te = max(echo_groups)
+        discarded_echo_times = sorted(te for te in echo_groups if te != kept_te)
+        datasets = echo_groups[kept_te]
+
+    # Sort: prefer InstanceNumber, fall back to SliceLocation, then to
+    # insertion order. The first tuple element bands by source-of-truth so
+    # InstanceNumber-tagged datasets always precede SliceLocation-tagged
+    # ones — never interleaved — and untagged datasets land at the end in
+    # the order they arrived.
+    _BY_INSTANCE_NUMBER = 0
+    _BY_SLICE_LOCATION = 1
+    _UNTAGGED = 2
+
     def sort_key(ds):
         inst = getattr(ds, "InstanceNumber", None)
         if inst is not None:
-            return (0, int(inst))
+            return (_BY_INSTANCE_NUMBER, int(inst))
         sl = getattr(ds, "SliceLocation", None)
         if sl is not None:
-            return (1, float(sl))
-        return (2, 0)
+            return (_BY_SLICE_LOCATION, float(sl))
+        return (_UNTAGGED, 0)
 
     datasets.sort(key=sort_key)
 
@@ -180,80 +314,61 @@ def load_series(sources: Iterable) -> DicomSeries:
     arrays = [a if a.shape == shape else _pad_or_crop(a, shape) for a in arrays]
     volume = np.stack(arrays, axis=0)
 
-    # Metadata from first dataset
-    head = datasets[0]
-    meta = SeriesMetadata(
-        patient_name=str(getattr(head, "PatientName", "") or ""),
-        patient_id=str(getattr(head, "PatientID", "") or ""),
-        study_date=str(getattr(head, "StudyDate", "") or ""),
-        manufacturer=str(getattr(head, "Manufacturer", "") or ""),
-        model=str(getattr(head, "ManufacturerModelName", "") or ""),
-        field_strength_t=float(getattr(head, "MagneticFieldStrength", 0.0) or 0.0),
-        series_description=str(getattr(head, "SeriesDescription", "") or ""),
-        series_number=int(getattr(head, "SeriesNumber", 0) or 0),
-        slice_thickness_mm=float(getattr(head, "SliceThickness", 0.0) or 0.0),
-        spacing_between_slices_mm=float(getattr(head, "SpacingBetweenSlices", 0.0) or 0.0),
-        rows=int(volume.shape[1]),
-        cols=int(volume.shape[2]),
-        n_slices=int(volume.shape[0]),
-        repetition_time_ms=float(getattr(head, "RepetitionTime", 0.0) or 0.0),
-        echo_time_ms=float(getattr(head, "EchoTime", 0.0) or 0.0),
-    )
-    ps = getattr(head, "PixelSpacing", [1.0, 1.0])
-    meta.pixel_spacing_mm = (float(ps[0]), float(ps[1]))
-
-    # Guess sequence type
-    desc = meta.series_description.lower()
-    if "t1" in desc:
-        meta.sequence = "T1"
-    elif "t2" in desc or "dual" in desc:
-        meta.sequence = "T2"
-    elif "loc" in desc:
-        meta.sequence = "Localizer"
-    else:
-        meta.sequence = "Unknown"
+    meta = _metadata_from_dataset(datasets[0], volume, discarded_echo_times)
 
     slice_locations = [float(getattr(ds, "SliceLocation", i)) for i, ds in enumerate(datasets)]
     instance_numbers = [int(getattr(ds, "InstanceNumber", i + 1)) for i, ds in enumerate(datasets)]
 
+    spec = default_phantom()
     series = DicomSeries(
         pixel_array=volume,
         slice_locations_mm=slice_locations,
         instance_numbers=instance_numbers,
         metadata=meta,
         datasets=datasets,
+        spec=spec,
     )
-    series.acr_slice_map = default_acr_slice_map(volume.shape[0])
+    series.acr_slice_map = default_acr_slice_map(volume.shape[0], spec)
     return series
 
 
-def _pad_or_crop(arr: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
-    """Make sure all slices share the same (rows, cols)."""
-    out = np.zeros(target_shape, dtype=arr.dtype)
-    rs = min(arr.shape[0], target_shape[0])
-    cs = min(arr.shape[1], target_shape[1])
-    out[:rs, :cs] = arr[:rs, :cs]
-    return out
-
-
-def default_acr_slice_map(n_slices: int) -> dict[int, int]:
-    """The ACR Large Phantom protocol acquires 11 axial slices. The ACR
-    test procedures reference *slice 1* (inferior, with the bars/wedges),
+def default_acr_slice_map(n_slices: int, spec: PhantomSpec | None = None) -> dict[int, int]:
+    """The standard ACR axial protocol acquires 11 slices. The ACR test
+    procedures reference *slice 1* (inferior, with the bars/wedges),
     *slice 5* (central), *slice 7* (uniform region), and *slice 11* (the
-    superior wedge-pair). When a series has exactly 11 slices the
-    default mapping is the natural one. For shorter series we fall back
-    to evenly-spaced picks so the app remains usable on partial data."""
-    if n_slices >= 11:
-        return {1: 0, 5: 4, 7: 6, 11: 10}
+    superior wedge-pair). When a series matches the protocol slice count
+    we use the spec's standard mapping. For shorter series we fall back
+    to evenly-spaced picks so the app remains usable on partial data.
+
+    The returned key set is intentionally partial when ``n_slices`` is
+    very small: roles 8-10 are omitted if the offset arithmetic from
+    role 11 would go negative, and the empty dict is returned for an
+    empty series. Callers reach individual slices via
+    ``DicomSeries.try_slice(role, spec_fallback=True)``, which handles
+    missing roles by falling back to the spec's standard mapping.
+    """
+    if spec is None:
+        spec = default_phantom()
+    if n_slices >= spec.n_protocol_slices:
+        return dict(spec.slice_role_indices)
     if n_slices == 0:
         return {}
     # Best effort: spread across whatever we have
-    return {
+    n_prot = spec.n_protocol_slices
+    out: dict[int, int] = {
         1: 0,
         5: min(n_slices - 1, n_slices // 2 - 1 if n_slices >= 2 else 0),
-        7: min(n_slices - 1, (n_slices * 6) // 11),
+        7: min(n_slices - 1, (n_slices * 6) // n_prot),
         11: n_slices - 1,
     }
+    # Map LCD-adjacent roles relative to whatever we picked for slice 11,
+    # so LCD scoring still has something to display on partial series.
+    last = out[11]
+    for role, offset in ((10, 1), (9, 2), (8, 3)):
+        idx = last - offset
+        if idx >= 0:
+            out[role] = idx
+    return out
 
 
 def load_series_from_folder(folder: str | Path) -> DicomSeries:
@@ -276,23 +391,27 @@ def validate_series(series: DicomSeries) -> list[str]:
     """
     warnings: list[str] = []
     md = series.metadata
+    spec = series.spec
+    n_prot = spec.n_protocol_slices
 
     # Slice count
     if md.n_slices < 5:
         warnings.append(
-            f"Series has only {md.n_slices} slice(s). The ACR Large Phantom "
-            "protocol acquires 11 axial slices. Tests that need slice 11 will fail."
+            f"Series has only {md.n_slices} slice(s). The {spec.name} "
+            f"protocol acquires {n_prot} axial slices. Tests that need slice "
+            f"{n_prot} will fail."
         )
-    elif md.n_slices < 11:
+    elif md.n_slices < n_prot:
         warnings.append(
-            f"Series has {md.n_slices} slices but the ACR Large Phantom protocol "
-            "uses 11. Slice-role mapping has been guessed; verify on the Slice "
-            "Mapping tab."
+            f"Series has {md.n_slices} slices but the {spec.name} protocol "
+            f"uses {n_prot}. Slice-role mapping has been guessed; verify on the "
+            "Slice Mapping tab."
         )
-    elif md.n_slices > 11:
+    elif md.n_slices > n_prot:
         warnings.append(
-            f"Series has {md.n_slices} slices (expected 11). Auto-mapping picked "
-            "the first 11; if your protocol differs, override on the Slice Mapping tab."
+            f"Series has {md.n_slices} slices (expected {n_prot}). Auto-mapping "
+            f"picked the first {n_prot}; if your protocol differs, override on "
+            "the Slice Mapping tab."
         )
 
     # Pixel spacing
@@ -314,8 +433,8 @@ def validate_series(series: DicomSeries) -> list[str]:
         )
     elif md.slice_thickness_mm < 3 or md.slice_thickness_mm > 8:
         warnings.append(
-            f"SliceThickness {md.slice_thickness_mm:.1f} mm differs from the ACR "
-            "Large Phantom standard (5 mm)."
+            f"SliceThickness {md.slice_thickness_mm:.1f} mm differs from the "
+            f"{spec.name} standard ({spec.nominal_slice_thickness_mm:.0f} mm)."
         )
 
     # Sequence guess
@@ -325,7 +444,18 @@ def validate_series(series: DicomSeries) -> list[str]:
             f"('{md.series_description}'). Tests assume an ACR T1 or T2 axial series."
         )
 
-    # Image orientation: ACR Large Phantom protocol is axial.
+    # Multi-echo series: warn the user what was kept/dropped.
+    if md.discarded_echo_times_ms:
+        kept = md.echo_time_ms
+        dropped_str = ", ".join(f"{te:g} ms" for te in md.discarded_echo_times_ms)
+        warnings.append(
+            "Detected a multi-echo acquisition. Per the 2022 ACR Test Guidance "
+            f"(§ 0.3), only the longest-TE images are evaluated — kept "
+            f"TE = {kept:g} ms, dropped TE = {dropped_str}. If this looks wrong, "
+            "re-export only the desired echo series from the scanner."
+        )
+
+    # Image orientation: the ACR axial protocol is, well, axial.
     ds = series.datasets[0] if series.datasets else None
     if ds is not None and hasattr(ds, "ImageOrientationPatient"):
         try:
@@ -334,9 +464,9 @@ def validate_series(series: DicomSeries) -> list[str]:
             if not (abs(iop[0]) > 0.95 and abs(iop[4]) > 0.95):
                 warnings.append(
                     "ImageOrientationPatient suggests the series is not strictly "
-                    "axial. ACR Large Phantom procedures assume axial acquisition."
+                    f"axial. {spec.name} procedures assume axial acquisition."
                 )
-        except Exception:
-            pass
+        except (TypeError, ValueError, IndexError):
+            logger.debug("ImageOrientationPatient parse failed", exc_info=True)
 
     return warnings

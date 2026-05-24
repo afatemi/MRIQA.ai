@@ -20,6 +20,8 @@ from scipy import ndimage as ndi
 from skimage.filters import threshold_otsu
 from skimage.measure import label, regionprops
 
+from .phantom_spec import PHANTOMS, PhantomSpec, default_phantom
+
 
 @dataclass
 class PhantomGeometry:
@@ -49,7 +51,9 @@ def localize_phantom(image: np.ndarray, fill_holes: bool = True) -> PhantomGeome
 
     try:
         t = threshold_otsu(img)
-    except Exception:
+    except ValueError:
+        # threshold_otsu raises ValueError on a constant-signal image; fall
+        # back to a midpoint threshold so segmentation can still proceed.
         t = (img.max() + img.min()) / 2.0
 
     binary = img > t
@@ -72,8 +76,42 @@ def localize_phantom(image: np.ndarray, fill_holes: bool = True) -> PhantomGeome
     return PhantomGeometry(cx_px=cx, cy_px=cy, radius_px=radius_px, mask=mask)
 
 
-def phantom_quality_warnings(geom: PhantomGeometry, pixel_spacing_mm: tuple[float, float]) -> list[str]:
-    """Heuristic checks on whether the detected phantom looks like an ACR Large Phantom.
+def detect_phantom_spec(
+    image: np.ndarray,
+    pixel_spacing_mm: tuple[float, float],
+    candidates: dict[str, PhantomSpec] | None = None,
+) -> PhantomSpec:
+    """Pick the phantom spec whose nominal diameter is closest to the
+    **left-right width** measured on ``image`` (typically ACR slice 1, or
+    the sagittal localizer where the axial circumference also runs L-R).
+
+    L-R is used rather than top-bottom or an area-equivalent diameter
+    because air bubbles at the top of the phantom can shrink the mask
+    along the A-P / S-I axis and skew an area-based estimate.
+
+    Falls back to ``default_phantom`` when segmentation fails or returns
+    an empty mask.
+    """
+    pool = candidates or PHANTOMS
+    try:
+        geom = localize_phantom(image)
+        xs = np.where(geom.mask)[1]
+        if xs.size == 0:
+            return default_phantom()
+        width_px = float(xs.max() - xs.min() + 1)
+        measured_mm = width_px * pixel_spacing_mm[1]
+    except (ValueError, IndexError):
+        return default_phantom()
+    return min(pool.values(), key=lambda s: abs(s.diameter_mm - measured_mm))
+
+
+def phantom_quality_warnings(
+    geom: PhantomGeometry,
+    pixel_spacing_mm: tuple[float, float],
+    spec: PhantomSpec,
+) -> list[str]:
+    """Heuristic checks on whether the detected phantom matches the selected
+    spec.
 
     Returns a list of human-readable warning strings; an empty list means
     the detection looks plausible. Used by every QA test to flag situations
@@ -82,14 +120,12 @@ def phantom_quality_warnings(geom: PhantomGeometry, pixel_spacing_mm: tuple[floa
     """
     out: list[str] = []
     rad_mm = geom.radius_px * 0.5 * (pixel_spacing_mm[0] + pixel_spacing_mm[1])
-    # ACR Large Phantom is 190 mm diameter (95 mm radius). On the slice-thickness
-    # slice the imaged outline is slightly smaller (~74 mm in the S-I direction
-    # because of the bar). On all other slices we expect radius near 95 mm.
-    if rad_mm < 70 or rad_mm > 115:
+    lo, hi = spec.radius_plausible_mm
+    if rad_mm < lo or rad_mm > hi:
         out.append(
             f"Detected phantom radius {rad_mm:.0f} mm is outside the expected range "
-            f"(70–115 mm) for the ACR Large Phantom. The segmentation may have included "
-            f"background or missed part of the phantom."
+            f"({lo:.0f}–{hi:.0f} mm) for the {spec.name}. The segmentation may have "
+            "included background or missed part of the phantom."
         )
     return out
 
